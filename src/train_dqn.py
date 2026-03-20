@@ -228,11 +228,12 @@ def train_dqn_vector(vec_env, total_steps=50000):
         writer.add_scalar("Accuracy/False Positive", (rewards == Config().r_false_positive).sum(), step * num_envs)
         writer.add_scalar("Accuracy/True Negative", (rewards == Config().r_true_negative).sum(), step * num_envs)
         writer.add_scalar("Accuracy/False Negative", (rewards == Config().r_false_negative).sum(), step * num_envs)
+        writer.add_scalar("Epsilon", epsilon, step * num_envs)
 
         # If any environment finished, extract its true final state
         for i, d in enumerate(dones):
             if d:
-                if step % 1 == 0:
+                if step % 50 == 0:
                     print(f"Step {step} | Env {i} completed | Reward: {episode_returns[i]:.2f} | Epsilon: {epsilon:.3f}")
                         
                 # Reset the return tracker for this sub-environment
