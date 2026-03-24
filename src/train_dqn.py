@@ -10,6 +10,7 @@ from collections import deque
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
 import os
+from vit_pytorch import ViT
 
 data = pd.read_parquet("./data/Dapper/norm_dapper_1m.parquet")
 data['Time'] = pd.to_datetime(data['Time'])
@@ -17,10 +18,11 @@ data['Time'] = pd.to_datetime(data['Time'])
 skipped_subject = [1024, 2011]
 
 class Config:
-    past_window = 15
+    past_window = 16
     env_length = 120
     early_detection_window = 10
     late_detection_window = 2
+    prediction_window = 5
 
     r_true_positive = 1.0
     r_false_positive = -0.5
@@ -170,7 +172,7 @@ def train_dqn_vector(vec_env, total_steps=50000):
     MEMORY_SIZE = 100000
     TARGET_UPDATE_FREQ = 10 
     
-    EPSILON_START = 1.0
+    EPSILON_START = 0.9
     EPSILON_END = 0.05
     EPSILON_DECAY = 10000 
 
@@ -182,8 +184,26 @@ def train_dqn_vector(vec_env, total_steps=50000):
     n_actions = vec_env.single_action_space.n
     num_envs = vec_env.num_envs
 
-    policy_net = DQN(single_obs_shape, n_actions).to(device)
-    target_net = DQN(single_obs_shape, n_actions).to(device)
+    policy_net = ViT(
+        image_size = single_obs_shape,
+        patch_size = 8,
+        num_classes = n_actions,
+        dim = 256,
+        depth = 6,
+        heads = 8,
+        mlp_dim = 512,
+        channels = 1
+    ).to(device) # DQN(single_obs_shape, n_actions).to(device)
+    target_net = ViT(
+        image_size = single_obs_shape,
+        patch_size = 8,
+        num_classes = n_actions,
+        dim = 256,
+        depth = 6,
+        heads = 8,
+        mlp_dim = 512,
+        channels = 1
+    ).to(device) # DQN(single_obs_shape, n_actions).to(device)
     target_net.load_state_dict(policy_net.state_dict())
     target_net.eval()
 
@@ -197,18 +217,30 @@ def train_dqn_vector(vec_env, total_steps=50000):
     # Track episodic returns manually for logging
     episode_returns = np.zeros(num_envs)
 
+    past_prediction_buffer = np.zeros((num_envs, Config().prediction_window))
+
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     writer = SummaryWriter(f"run/{timestamp}")
 
     for step in range(total_steps):
         epsilon = EPSILON_END + (EPSILON_START - EPSILON_END) * \
                   np.exp(-1. * step / EPSILON_DECAY)
-
+                  
         # --- Batched Action Selection ---
         if random.random() > epsilon:
             with torch.no_grad():
                 states_tensor = torch.FloatTensor(states).to(device)
+                states_tensor = states_tensor.unsqueeze(1)
                 q_values = policy_net(states_tensor)
+
+
+                # probs = torch.softmax(q_values, dim = 1).cpu().numpy()
+                # past_prediction_buffer[:, 1:] = past_prediction_buffer[:, 0:-1]
+                # past_prediction_buffer[:, 0] = probs[:, 1]
+                # p = 1 - np.prod(1 - past_prediction_buffer, axis = 1)
+                # actions = (random.random() < p).astype(int)
+
+
                 actions = q_values.argmax(dim=1).cpu().numpy()
         else:
             actions = vec_env.action_space.sample()
@@ -256,9 +288,11 @@ def train_dqn_vector(vec_env, total_steps=50000):
             next_states_t = torch.FloatTensor(b_next_states).to(device)
             dones_t = torch.FloatTensor(b_dones).unsqueeze(1).to(device)
 
+            states_t = states_t.unsqueeze(1)
             current_q_values = policy_net(states_t).gather(1, actions_t)
 
             with torch.no_grad():
+                next_states_t = next_states_t.unsqueeze(1)
                 max_next_q_values = target_net(next_states_t).max(1)[0].unsqueeze(1)
                 expected_q_values = rewards_t + (GAMMA * max_next_q_values * (1 - dones_t))
 
@@ -279,6 +313,6 @@ if __name__ == "__main__":
     num_parallel_envs = 128
     vec_env = gym.vector.SyncVectorEnv([make_env(i) for i in range(num_parallel_envs)])
     # 3. Train!
-    trained_model = train_dqn_vector(vec_env, total_steps=5000)
+    trained_model = train_dqn_vector(vec_env, total_steps=50000)
     
     vec_env.close()
