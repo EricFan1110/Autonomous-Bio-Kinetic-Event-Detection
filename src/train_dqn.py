@@ -5,28 +5,50 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from collections import deque
-from torch.utils.tensorboard import SummaryWriter
+import torch.nn.functional as F
 from datetime import datetime
-import os
-from vit_pytorch import ViT
+import stable_baselines3
 
-data = pd.read_parquet("./data/Dapper/norm_dapper_1m.parquet")
-data['Time'] = pd.to_datetime(data['Time'])
+from stable_baselines3.common.callbacks import BaseCallback
 
-skipped_subject = [1024, 2011]
+class InfoLoggingCallback(BaseCallback):
+    def __init__(self, info_key="prob", verbose=0):
+        """
+        :param info_key: The key in the info dictionary you want to log.
+        """
+        super().__init__(verbose)
+        self.info_key = info_key
+
+    def _on_step(self) -> bool:
+        # Access the 'infos' list from the local variables
+        infos = self.locals.get("infos", [])
+        
+        # Extract the probability from all environments (if using multiple)
+        probs = []
+        for info in infos:
+            if self.info_key in info:
+                probs.append(info[self.info_key])
+        
+        # If we found the probability, log it
+        if probs:
+            # Average the value in case of multiple vectorized environments
+            mean_prob = np.mean(probs)
+            
+            # Record it to TensorBoard under a custom heading (e.g., "custom/prob")
+            self.logger.record(f"custom/{self.info_key}", mean_prob)
+            
+        return True # Return True to continue training
 
 class Config:
-    past_window = 16
-    env_length = 120
+    past_window = 1
+    env_length = 15
     early_detection_window = 10
     late_detection_window = 2
     prediction_window = 5
 
     r_true_positive = 1.0
-    r_false_positive = -0.5
-    r_true_negative = 0.001
+    r_false_positive = -1.0
+    r_true_negative = 1.0
     r_false_negative = -1.0
 
 @torch.compile
@@ -48,42 +70,36 @@ class DQN(nn.Module):
         )
 
     def forward(self, x):
-        return self.network(x)
+        x = self.network(x)
 
-class ReplayBuffer:
-    def __init__(self, capacity):
-        self.buffer = deque(maxlen=capacity)
-
-    def push(self, state, action, reward, next_state, done):
-        self.buffer.append((state, action, reward, next_state, done))
-
-    def push_batch(self, states, actions, rewards, next_states, dones):
-        # Insert a batch of transitions from the parallel environments
-        for i in range(len(states)):
-            self.buffer.append((states[i], actions[i], rewards[i], next_states[i], dones[i]))
-
-    def sample(self, batch_size):
-        batch = random.sample(self.buffer, batch_size)
-        states, actions, rewards, next_states, dones = zip(*batch)
-        return (np.array(states), np.array(actions), np.array(rewards), 
-                np.array(next_states), np.array(dones))
-
-    def __len__(self):
-        return len(self.buffer)
+        return x
 
 class StressDetectionEnv(gym.Env):
+    # data = pd.read_parquet("./data/Dapper/dapper_dqn_norm.parquet")
+    # data['Time'] = pd.to_datetime(data['Time'])
+    feature_df = pd.read_csv("./data/WESAD/WESAD_table_norm.csv")
+    feature_df["Features"] = feature_df['Features'].str.strip('[]').str.split().apply(lambda x: [float(i) for i in x])
+    embed_df = pd.read_parquet("./data/WESAD/WESAD_table_Normwear_Encoding_60s.parquet")
+
+    combine_data = pd.merge(embed_df, feature_df, on=['Time', "PID"], how='inner')
+    combine_data["Features"] = [np.concatenate([a, b]) for a, b in zip(combine_data['Features_x'], combine_data['Features_y'])]
+    combine_data["Baseline"] = combine_data["Baseline_x"]
+    combine_data["Stress"] = combine_data["Stress_x"]
+    combine_data["Amusement"] = combine_data["Amusement_x"]
+    combine_data["Meditation"] = combine_data["Meditation_x"]
+    combine_data["Valence"] = combine_data["Valence_x"]
+    combine_data["Arousal"] = combine_data["Arousal_x"]
+
     def __init__(self, config = Config(), seed = None):
         super(StressDetectionEnv, self).__init__()
         self.config = config
         self.rng = np.random.default_rng(seed=seed)
         
-        # Define Action Space: 0 = Not Stressed, 1 = Stressed
         self.action_space = spaces.Discrete(2)
-        self.feature_count = np.array(data["Features"].tolist()).shape[1]
+        self.feature_count = np.array(StressDetectionEnv.data["Features"].tolist()).shape[1]
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, 
                                             shape=(config.past_window, self.feature_count), dtype=np.float32)
-        
-        self.current_subject = 0
+
         self.timestep = 0
 
     def reset(self, seed = None, options = None):
@@ -91,37 +107,13 @@ class StressDetectionEnv(gym.Env):
             self.rng = np.random.default_rng(seed=seed)
         self.timestep = 0
 
-        selected = False
-        while not selected:
-            self.current_subject = self.rng.choice(data["PID"].unique())
-            while self.current_subject in skipped_subject:
-                self.current_subject = self.rng.choice(data["PID"].unique())
+        label_idx = self.rng.choice(StressDetectionEnv.data["Label Index"].unique())
+        self.env_data = StressDetectionEnv.data[StressDetectionEnv.data["Label Index"] == label_idx]
+        self.env_data = self.env_data.sort_values("Time").reset_index(drop=True)
+        if len(self.env_data) < self.config.env_length - 2:
+            return self.reset(seed=seed)
 
-            subject_data = data[data["PID"] == self.current_subject]
-            subject_data = subject_data.sort_values("Time").reset_index(drop=True)
-
-            self.env_data = pd.DataFrame()
-            try_counter = 0
-            while len(self.env_data) < self.config.env_length + 1:
-                try_counter += 1
-                if try_counter > 1000:
-                    break
-
-                start_time = self.rng.choice(data["Time"].unique())
-                end_time = start_time + pd.Timedelta(minutes=self.config.env_length + 1 + 30)
-                self.env_data = subject_data[(subject_data["Time"] >= start_time) & (subject_data["Time"] < end_time)]
-                self.env_data = self.env_data.sort_values("Time").reset_index(drop=True)
-                if len(self.env_data[self.env_data["Label"] == 1].index.tolist()) > 0:
-                    if min(self.env_data[self.env_data["Label"] == 1].index.tolist()) < self.config.past_window:
-                        continue
-
-                if len(self.env_data) >= self.config.env_length + 1:
-                    selected = True
-
-        num_stress_label = len(self.env_data[self.env_data["Label"] == 1].index.tolist())
-        self.stress_labels_time = np.inf
-        if num_stress_label > 0:
-            self.stress_labels_time = min(self.env_data[self.env_data["Label"] == 1].index.tolist())
+        self.stress_label = self.env_data["Stress"].iloc[0]
 
         obs = np.array(self.env_data["Features"].iloc[self.timestep : self.timestep + self.config.past_window].tolist(), dtype=np.float32) # shape: (T, Feature dim)
         return obs, {}
@@ -135,26 +127,135 @@ class StressDetectionEnv(gym.Env):
         # Detect Stress
         if action == 1:
             terminated = True
-            
-            t_diff = self.stress_labels_time - (self.timestep + self.config.past_window)
-            if t_diff <= self.config.early_detection_window and t_diff >= -self.config.late_detection_window:
+
+            if self.stress_label == 1:
                 reward = self.config.r_true_positive
             else:
                 reward = self.config.r_false_positive
-        else:
-            t_diff = self.stress_labels_time - (self.timestep + self.config.past_window)
-            if t_diff > self.config.early_detection_window:
-                reward = self.config.r_true_negative
-            elif t_diff < -self.config.late_detection_window:
-                reward = self.config.r_false_negative
-                terminated = True
 
         # Played till end of environment without detecting stress
-        if self.timestep >= self.config.env_length - self.config.past_window:
-            truncation = True
+        if self.timestep >= len(self.env_data) - self.config.past_window - 1:
+            terminated = True
+            if action == 0:
+                if self.stress_label == 0:
+                    reward = self.config.r_true_negative
+                else:
+                    reward = self.config.r_false_negative
 
         self.timestep += 1
         obs = np.array(self.env_data["Features"].iloc[self.timestep : self.timestep + self.config.past_window].tolist(), dtype=np.float32)
+
+        return obs, reward, terminated, truncation, info
+
+class StressDetectionEnv_WESAD(gym.Env):
+    feature_df = pd.read_csv("./data/WESAD/WESAD_table_norm.csv")
+    feature_df["Features"] = feature_df['Features'].str.strip('[]').str.split().apply(lambda x: [float(i) for i in x])
+    embed_df = pd.read_parquet("./data/WESAD/WESAD_table_Normwear_Encoding_60s.parquet")
+
+    combine_data = pd.merge(embed_df, feature_df, on=['Time', "PID"], how='inner')
+    combine_data["Features"] = [np.concatenate([a, b]) for a, b in zip(combine_data['Features_x'], combine_data['Features_y'])]
+    combine_data["Baseline"] = combine_data["Baseline_x"]
+    combine_data["Stress"] = combine_data["Stress_x"]
+    combine_data["Amusement"] = combine_data["Amusement_x"]
+    combine_data["Meditation"] = combine_data["Meditation_x"]
+    combine_data["Valence"] = combine_data["Valence_x"]
+    combine_data["Arousal"] = combine_data["Arousal_x"]
+    data = combine_data
+
+    def __init__(self, val_id, config = Config(), seed = None):
+        super(StressDetectionEnv_WESAD, self).__init__()
+        self.config = config
+        self.rng = np.random.default_rng(seed=seed)
+        
+        self.action_space = spaces.Discrete(2)
+        self.feature_count = np.array(StressDetectionEnv_WESAD.data["Features"].tolist()).shape[1]
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, 
+                                            shape=(config.past_window, self.feature_count + 2), dtype=np.float32)
+
+        self.timestep = 0
+        self.past_prediction_buffer = np.zeros((self.config.prediction_window, 1))
+        self.val_pid = val_id
+
+        self.pretrained_model = DQN(np.array(StressDetectionEnv_WESAD.data["Features"].tolist()).shape[1], 2)
+        weights = torch.load(f"./run/20260414-165329_Both_Bin_stress/model_latest_{val_id}.pth")
+        new_state_dict = {}
+        for sb3_key, pretrained_weight in zip(self.pretrained_model.state_dict().keys(), weights.values()):
+            new_state_dict[sb3_key] = pretrained_weight
+        self.pretrained_model.load_state_dict(new_state_dict)
+        self.pretrained_model.eval()
+
+    def reset(self, seed = None, options = None):
+        if seed is not None:
+            self.rng = np.random.default_rng(seed=seed)
+        self.timestep = 0
+
+        tr_pid = self.rng.choice(StressDetectionEnv_WESAD.data[StressDetectionEnv_WESAD.data["PID"] != self.val_pid]["PID"].unique())
+        self.env_data = StressDetectionEnv_WESAD.data[StressDetectionEnv_WESAD.data["PID"] == tr_pid]
+        self.env_data = self.env_data.sort_values("Time").reset_index(drop=True)
+
+        max_time = self.env_data["Time"].iloc[-1]
+        time = random.randrange(0, max_time - (self.config.env_length) * 30, 30)
+        self.env_data = self.env_data[self.env_data["Time"].between(time, time + self.config.env_length * 30)]
+
+        self.past_prediction_buffer = np.zeros((self.config.prediction_window, 1))
+
+        self.stress_label = np.where(self.env_data[["Baseline", "Amusement", "Meditation"]].sum(axis=1) > self.env_data['Stress'].to_numpy(), 0, 1).any()
+
+        obs = np.array(self.env_data["Features"].iloc[self.timestep : self.timestep + self.config.past_window].tolist(), dtype=np.float32) # shape: (T, Feature dim)
+        
+        time_label = 1
+        if self.env_data[["Baseline", "Amusement", "Meditation"]].iloc[self.timestep].sum(axis=0) > self.env_data['Stress'].iloc[self.timestep].item():
+            time_label = 0
+        with torch.no_grad():
+            logits = self.pretrained_model(torch.tensor(obs))
+        stress_prob = F.softmax(logits, dim=1)
+        prob_reshaped = stress_prob.reshape(1,2)
+        obs = np.concatenate((obs, prob_reshaped), axis=1)
+
+        info = {"prob": stress_prob[0][1].item() - time_label}
+
+        return obs, info
+
+    def step(self, action):
+        terminated = False
+        reward = 0.0
+        truncation = False
+        info = {}
+
+        self.past_prediction_buffer[1:, :] = self.past_prediction_buffer[0:-1, :]
+        self.past_prediction_buffer[0, :] = action
+
+        # Detect Stress
+        if action == 1:
+            terminated = True
+
+            if self.stress_label == 1:
+                reward = self.config.r_true_positive - (self.timestep / (25 + self.timestep))
+            else:
+                reward = self.config.r_false_positive + (self.timestep / (25 + self.timestep))
+
+        # Played till end of environment without detecting stress
+        if self.timestep >= len(self.env_data) - self.config.past_window - 1:
+            terminated = True
+            if action == 0:
+                if self.stress_label == 0:
+                    reward = self.config.r_true_negative
+                else:
+                    reward = self.config.r_false_negative - (self.timestep / (25 + self.timestep))
+
+        self.timestep += 1
+        obs = np.array(self.env_data["Features"].iloc[self.timestep : self.timestep + self.config.past_window].tolist(), dtype=np.float32)
+
+        time_label = 1
+        if self.env_data[["Baseline", "Amusement", "Meditation"]].iloc[self.timestep].sum(axis=0) > self.env_data['Stress'].iloc[self.timestep].item():
+            time_label = 0
+
+        with torch.no_grad():
+            logits = self.pretrained_model(torch.tensor(obs))
+        stress_prob = F.softmax(logits, dim=1)
+        prob_reshaped = stress_prob.reshape(1,2)
+        obs = np.concatenate((obs, prob_reshaped), axis=1)
+        info["prob"] = stress_prob[0][1].item() - time_label
 
         return obs, reward, terminated, truncation, info
 
@@ -164,155 +265,40 @@ def make_env(seed=None):
         return env
     return _init
 
-def train_dqn_vector(vec_env, total_steps=50000):
-    # Hyperparameters
-    BATCH_SIZE = 128       # Increased batch size since we gather data faster
-    GAMMA = 0.99
-    LR = 1e-4
-    MEMORY_SIZE = 100000
-    TARGET_UPDATE_FREQ = 10 
-    
-    EPSILON_START = 0.9
-    EPSILON_END = 0.05
-    EPSILON_DECAY = 10000 
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Training on device: {device}")
-
-    # For VectorEnvs, we use single_observation_space and single_action_space
-    single_obs_shape = vec_env.single_observation_space.shape
-    n_actions = vec_env.single_action_space.n
-    num_envs = vec_env.num_envs
-
-    policy_net = ViT(
-        image_size = single_obs_shape,
-        patch_size = 8,
-        num_classes = n_actions,
-        dim = 256,
-        depth = 6,
-        heads = 8,
-        mlp_dim = 512,
-        channels = 1
-    ).to(device) # DQN(single_obs_shape, n_actions).to(device)
-    target_net = ViT(
-        image_size = single_obs_shape,
-        patch_size = 8,
-        num_classes = n_actions,
-        dim = 256,
-        depth = 6,
-        heads = 8,
-        mlp_dim = 512,
-        channels = 1
-    ).to(device) # DQN(single_obs_shape, n_actions).to(device)
-    target_net.load_state_dict(policy_net.state_dict())
-    target_net.eval()
-
-    optimizer = optim.Adam(policy_net.parameters(), lr=LR)
-    memory = ReplayBuffer(MEMORY_SIZE)
-    loss_fn = nn.SmoothL1Loss()
-
-    # Reset all environments once at the beginning
-    states, _ = vec_env.reset()
-    
-    # Track episodic returns manually for logging
-    episode_returns = np.zeros(num_envs)
-
-    past_prediction_buffer = np.zeros((num_envs, Config().prediction_window))
-
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    writer = SummaryWriter(f"run/{timestamp}")
-
-    for step in range(total_steps):
-        epsilon = EPSILON_END + (EPSILON_START - EPSILON_END) * \
-                  np.exp(-1. * step / EPSILON_DECAY)
-                  
-        # --- Batched Action Selection ---
-        if random.random() > epsilon:
-            with torch.no_grad():
-                states_tensor = torch.FloatTensor(states).to(device)
-                states_tensor = states_tensor.unsqueeze(1)
-                q_values = policy_net(states_tensor)
-
-
-                # probs = torch.softmax(q_values, dim = 1).cpu().numpy()
-                # past_prediction_buffer[:, 1:] = past_prediction_buffer[:, 0:-1]
-                # past_prediction_buffer[:, 0] = probs[:, 1]
-                # p = 1 - np.prod(1 - past_prediction_buffer, axis = 1)
-                # actions = (random.random() < p).astype(int)
-
-
-                actions = q_values.argmax(dim=1).cpu().numpy()
-        else:
-            actions = vec_env.action_space.sample()
-
-        # --- Step All Environments ---
-        next_states, rewards, terminations, truncations, infos = vec_env.step(actions)
-        dones = terminations | truncations
-        episode_returns += rewards
-
-        # --- Handle Gymnasium VectorEnv Auto-Resets ---
-        # Copy next_states to modify them without affecting the env's internal arrays
-        real_next_states = next_states.copy()
-        
-        writer.add_scalar("Reward", episode_returns.mean(), step * num_envs)
-        writer.add_scalar("Env terminated", dones.sum(), step * num_envs)
-        writer.add_scalar("Accuracy/True Positive", (rewards == Config().r_true_positive).sum(), step * num_envs)
-        writer.add_scalar("Accuracy/False Positive", (rewards == Config().r_false_positive).sum(), step * num_envs)
-        writer.add_scalar("Accuracy/True Negative", (rewards == Config().r_true_negative).sum(), step * num_envs)
-        writer.add_scalar("Accuracy/False Negative", (rewards == Config().r_false_negative).sum(), step * num_envs)
-        writer.add_scalar("Epsilon", epsilon, step * num_envs)
-
-        # If any environment finished, extract its true final state
-        for i, d in enumerate(dones):
-            if d:
-                if step % 50 == 0:
-                    print(f"Step {step} | Env {i} completed | Reward: {episode_returns[i]:.2f} | Epsilon: {epsilon:.3f}")
-                        
-                # Reset the return tracker for this sub-environment
-                episode_returns[i] = 0 
-
-        # --- Store in Memory ---
-        memory.push_batch(states, actions, rewards, real_next_states, dones)
-        
-        # We assign `states = next_states` (the raw output from step), 
-        # so the next loop starts with the newly reset state if an env finished.
-        states = next_states
-
-        # --- Optimize Model ---
-        if len(memory) >= BATCH_SIZE:
-            b_states, b_actions, b_rewards, b_next_states, b_dones = memory.sample(BATCH_SIZE)
-            
-            states_t = torch.FloatTensor(b_states).to(device)
-            actions_t = torch.LongTensor(b_actions).unsqueeze(1).to(device)
-            rewards_t = torch.FloatTensor(b_rewards).unsqueeze(1).to(device)
-            next_states_t = torch.FloatTensor(b_next_states).to(device)
-            dones_t = torch.FloatTensor(b_dones).unsqueeze(1).to(device)
-
-            states_t = states_t.unsqueeze(1)
-            current_q_values = policy_net(states_t).gather(1, actions_t)
-
-            with torch.no_grad():
-                next_states_t = next_states_t.unsqueeze(1)
-                max_next_q_values = target_net(next_states_t).max(1)[0].unsqueeze(1)
-                expected_q_values = rewards_t + (GAMMA * max_next_q_values * (1 - dones_t))
-
-            loss = loss_fn(current_q_values, expected_q_values)
-            
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_value_(policy_net.parameters(), 100)
-            optimizer.step()
-
-        # --- Update Target Network ---
-        if step % TARGET_UPDATE_FREQ == 0:
-            target_net.load_state_dict(policy_net.state_dict())
-
-    return policy_net
 
 if __name__ == "__main__":
-    num_parallel_envs = 128
-    vec_env = gym.vector.SyncVectorEnv([make_env(i) for i in range(num_parallel_envs)])
-    # 3. Train!
-    trained_model = train_dqn_vector(vec_env, total_steps=50000)
-    
-    vec_env.close()
+    SUBJECT_IDS = (
+        [f"S{i}" for i in range(2, 12)] +
+        [f"S{i}" for i in range(13, 18)]
+    )
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    for pid in SUBJECT_IDS:
+        name = f"{timestamp}_dqn_PID_with_pretrained_pred/{pid}"
+
+        env = StressDetectionEnv_WESAD(pid)
+        # pretrained_weights = torch.load("./run/20260409-161205_Both_Bin_stress/model_latest.pth")
+
+        policy_kwargs = dict(net_arch=[512, 256])
+        model = stable_baselines3.DQN(
+            "MlpPolicy", 
+            env, 
+            policy_kwargs=policy_kwargs,
+            verbose=1,
+            exploration_initial_eps=0.8,
+            exploration_final_eps=0.05,
+            tensorboard_log=f"./run/{name}"
+        )
+
+        # sb3_expected_keys = model.q_net.state_dict().keys()
+        # new_state_dict = {}
+        # for sb3_key, pretrained_weight in zip(sb3_expected_keys, pretrained_weights.values()):
+        #     new_state_dict[sb3_key] = pretrained_weight
+
+        # model.q_net.load_state_dict(new_state_dict, strict=True)
+        # model.q_net_target.load_state_dict(model.q_net.state_dict())
+
+        logging_callback = InfoLoggingCallback(info_key="prob")
+
+        model.learn(total_timesteps=200000, callback=logging_callback, log_interval=500)
+        model.save(f"./run/{name}/model")
+
