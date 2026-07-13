@@ -5,280 +5,342 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from collections import deque
-from torch.utils.tensorboard import SummaryWriter
+import torch.nn.functional as F
 from datetime import datetime
-import os
+import stable_baselines3
+from NormWear.modules.normwear import NormWear, cwt_wrap
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 
-data = pd.read_parquet("./data/Dapper/norm_dapper_1m.parquet")
-data['Time'] = pd.to_datetime(data['Time'])
+class InfoLoggingCallback(BaseCallback):
+    def __init__(self, info_key="prob", verbose=0):
+        """
+        :param info_key: The key in the info dictionary you want to log.
+        """
+        super().__init__(verbose)
+        self.info_key = info_key
 
-skipped_subject = [1024, 2011]
-
-class Config:
-    past_window = 15
-    env_length = 120
-    early_detection_window = 10
-    late_detection_window = 2
-
-    r_true_positive = 1.0
-    r_false_positive = -0.5
-    r_true_negative = 0.001
-    r_false_negative = -1.0
-
-@torch.compile
-class DQN(nn.Module):
-    def __init__(self, obs_shape, n_actions):
-        super(DQN, self).__init__()
+    def _on_step(self) -> bool:
+        # Access the 'infos' list from the local variables
+        infos = self.locals.get("infos", [])
         
-        # Calculate the flattened size of the observation
-        flat_size = np.prod(obs_shape)
+        # Extract the probability from all environments (if using multiple)
+        probs = []
+        for info in infos:
+            if self.info_key in info:
+                probs.append(info[self.info_key])
         
-        # Simple Multi-Layer Perceptron (MLP)
-        self.network = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(flat_size, 512),
+        # If we found the probability, log it
+        if probs:
+            # Average the value in case of multiple vectorized environments
+            mean_prob = np.mean(probs)
+            
+            # Record it to TensorBoard under a custom heading (e.g., "custom/prob")
+            self.logger.record(f"custom/{self.info_key}", mean_prob)
+            
+        return True # Return True to continue training
+
+class Config_Events:
+    past_window = 10
+    step_size = 1
+    prediction_window = 5
+
+    wait_penalty = -0.002
+    correct_base = 1.0
+    correct_lead = 0.35
+    wrong_base = -1.5
+    wrong_lead = -0.75
+    no_commit = -0.20
+    
+class MLP(nn.Module):
+    def __init__(self, input_shape, num_class):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_shape, 512),
             nn.ReLU(),
+            nn.Dropout(0.2),
             nn.Linear(512, 256),
             nn.ReLU(),
-            nn.Linear(256, n_actions)
+            nn.Linear(256, num_class), 
         )
 
     def forward(self, x):
-        return self.network(x)
+        return self.net(x), x
 
-class ReplayBuffer:
-    def __init__(self, capacity):
-        self.buffer = deque(maxlen=capacity)
+@torch.compile
+class NormwearMLP(nn.Module):
+    def __init__(self, embedding_length, num_class=2, normwear_weight_path=None):
+        super().__init__()
 
-    def push(self, state, action, reward, next_state, done):
-        self.buffer.append((state, action, reward, next_state, done))
+        if normwear_weight_path is None:
+            self.normwear = NormWear(img_size=(387,65), patch_size=(9,5),mask_scheme='random',mask_prob=0.8,use_cwt=True,nvar=4, comb_freq=False)
+            self.normwear.train()
+        else:
+            self.normwear = NormWear(img_size=(387,65), patch_size=(9,5),mask_scheme='random',mask_prob=0.8,use_cwt=True,nvar=4, comb_freq=False)
+            self.normwear.load_state_dict(torch.load(normwear_weight_path, map_location=torch.device('cpu')))
+            print(f"Loaded NormWear weights from {normwear_weight_path}")
+            self.normwear.train()
+        
+        self.embed_1 = nn.Sequential(
+            nn.Linear(768, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2)
+        )
+        self.embed_2 = nn.Sequential(
+            nn.Linear(2304, 256),
+            nn.ReLU(),
+            nn.Dropout(0.2)
+        )
+        self.output_head = nn.Linear(256, num_class)
 
-    def push_batch(self, states, actions, rewards, next_states, dones):
-        # Insert a batch of transitions from the parallel environments
-        for i in range(len(states)):
-            self.buffer.append((states[i], actions[i], rewards[i], next_states[i], dones[i]))
+        # self.net = nn.Sequential(
+        #     nn.Linear(embedding_length * 3, 1024),
+        #     nn.ReLU(),
+        #     nn.Dropout(0.2),
+        #     nn.Linear(1024, 512),
+        #     nn.ReLU(),
+        #     nn.Linear(512, num_class), 
+        # )
 
-    def sample(self, batch_size):
-        batch = random.sample(self.buffer, batch_size)
-        states, actions, rewards, next_states, dones = zip(*batch)
-        return (np.array(states), np.array(actions), np.array(rewards), 
-                np.array(next_states), np.array(dones))
+    def forward(self, x):
+        bn, window_size, nvar, L = x.shape
+        per_window_features = []
+        for window in range(window_size):
+            x_window = x[:, window, :, :] # [batch_size, sensors, seq_len]
 
-    def __len__(self):
-        return len(self.buffer)
+            cwt_res = cwt_wrap(x_window.reshape(bn*nvar, L), 0.1, 64)
+            _, n_, new_L, n_scale = cwt_res.shape
+            spec = cwt_res.view(bn, nvar, n_, new_L, n_scale).to(x.dtype)
 
-class StressDetectionEnv(gym.Env):
-    def __init__(self, config = Config(), seed = None):
-        super(StressDetectionEnv, self).__init__()
+            embedding = self.normwear.get_signal_embedding(spec.to(x.device), hidden_out=False, device=x.device)
+            embedding = embedding.mean(dim=2)
+            per_window_features.append(embedding)
+        per_window_features = torch.stack(per_window_features, dim=1).to(x.device)
+        mean_features = per_window_features.mean(dim=1)
+        std_features = per_window_features.std(dim=1, unbiased=False)
+        slope_features = self.temporal_slope(per_window_features)
+
+        combined_features = torch.stack([mean_features, std_features, slope_features], dim=1)
+        embed = self.embed_1(combined_features.flatten(1,2))
+        embed = self.embed_2(embed.flatten(1))
+
+        return self.output_head(embed), embed
+
+    def temporal_slope(self, features: torch.Tensor) -> torch.Tensor:
+        num_windows = features.shape[1]
+        positions = torch.arange(num_windows, device=features.device, dtype=features.dtype)
+        centered = positions - positions.mean()
+        denom = centered.pow(2).sum().clamp_min(1e-6)
+        centered = centered.view(1, num_windows, 1, 1)
+        _mean_feature = features.mean(dim=1, keepdim=True)
+        numer = ((features - _mean_feature) * centered).sum(dim=1)
+        return numer / denom
+
+
+class StressDetectionEnv_WESAD_Events(gym.Env):
+    data = pd.read_parquet("/diniuvol/jonah/Eric/data/WESAD/WESAD_Data_6s_6s.parquet")
+
+    def __init__(self, train_end = False, config = Config_Events(), seed = None):
+        super(StressDetectionEnv_WESAD_Events, self).__init__()
         self.config = config
         self.rng = np.random.default_rng(seed=seed)
+
+        self.train_end = train_end
         
-        # Define Action Space: 0 = Not Stressed, 1 = Stressed
         self.action_space = spaces.Discrete(2)
-        self.feature_count = np.array(data["Features"].tolist()).shape[1]
+        self.feature_count = 4608
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, 
-                                            shape=(config.past_window, self.feature_count), dtype=np.float32)
-        
-        self.current_subject = 0
+                                            shape=[256 + 1 + 9], dtype=np.float32)
+
         self.timestep = 0
+        self.past_prediction_buffer = np.zeros((self.config.prediction_window, 1))
+        self.train_ids = ['S3','S4','S5','S9','S10','S11','S14','S15','S16','S17']
+        self.val_ids = ['S7','S8']
+        self.test_ids = ['S2','S6','S13']
+
+        self.pretrained_model = NormwearMLP(4608, 2).cuda()
+        self.pretrained_model.load_state_dict(torch.load(f"/home/jonah/Eric/AutonomousBioKineticEventDetection/pretrained_normwear.pth"))
+        self.pretrained_model.eval()
+
+        wesad_root_dir = "/diniuvol/jonah/Eric/data/WESAD/"
+        target_keys = set(["Base", "TSST", "Medi 1", "Fun", "Medi 2"])
+        self.event_intervals = dict()
+        for pid in self.train_ids: # + self.val_ids + self.test_ids:
+            events_df = pd.read_csv(f"{wesad_root_dir}{pid}/{pid}_quest.csv", delimiter=';')
+            order_row = events_df.iloc[0]
+            start_row = events_df.iloc[1]
+            end_row = events_df.iloc[2]
+            intervals = dict()
+            
+            for col in events_df.columns[1:]:
+                key_name = str(order_row[col]).strip()
+                if key_name not in target_keys:
+                    continue
+                start_val = float(start_row[col])
+                end_val = float(end_row[col])
+                intervals[key_name] = (start_val, end_val)
+
+            self.event_intervals[pid] = intervals
+
 
     def reset(self, seed = None, options = None):
         if seed is not None:
             self.rng = np.random.default_rng(seed=seed)
         self.timestep = 0
 
-        selected = False
-        while not selected:
-            self.current_subject = self.rng.choice(data["PID"].unique())
-            while self.current_subject in skipped_subject:
-                self.current_subject = self.rng.choice(data["PID"].unique())
+        tr_pid = self.rng.choice(self.train_ids)
+        self.env_data = StressDetectionEnv_WESAD_Events.data[StressDetectionEnv_WESAD_Events.data["PID"] == tr_pid]
+        self.env_data = self.env_data.sort_values("Time").reset_index(drop=True)
 
-            subject_data = data[data["PID"] == self.current_subject]
-            subject_data = subject_data.sort_values("Time").reset_index(drop=True)
+        events = list(self.event_intervals[tr_pid].keys())
+        event_idx = self.rng.integers(0, len(self.event_intervals[tr_pid]))
+        event = events[event_idx]
+        start_time, end_time = self.event_intervals[tr_pid][event]
 
-            self.env_data = pd.DataFrame()
-            try_counter = 0
-            while len(self.env_data) < self.config.env_length + 1:
-                try_counter += 1
-                if try_counter > 1000:
-                    break
+        if event_idx > 0:
+            _, prev_end = self.event_intervals[tr_pid][events[event_idx - 1]]
+        else:
+            prev_end = 0.0
 
-                start_time = self.rng.choice(data["Time"].unique())
-                end_time = start_time + pd.Timedelta(minutes=self.config.env_length + 1 + 30)
-                self.env_data = subject_data[(subject_data["Time"] >= start_time) & (subject_data["Time"] < end_time)]
-                self.env_data = self.env_data.sort_values("Time").reset_index(drop=True)
-                if len(self.env_data[self.env_data["Label"] == 1].index.tolist()) > 0:
-                    if min(self.env_data[self.env_data["Label"] == 1].index.tolist()) < self.config.past_window:
-                        continue
+        # if event_idx < len(events) - 1:
+        #     next_start, _ = self.event_intervals[tr_pid][events[event_idx + 1]]
+        # else:
+        #     next_start = self.env_data["Time"].iloc[-1]
 
-                if len(self.env_data) >= self.config.env_length + 1:
-                    selected = True
+        self.env_data = self.env_data[self.env_data['Time'].between(int(prev_end * 60 - 54), int(end_time * 60))]
+        self.stress_label = event == 'TSST'
+        self.stress_label_idx = len(self.env_data)
+        if self.stress_label:
+            skip_rows = self.env_data.iloc[20:] if not self.train_end else self.env_data.iloc[:-20]
+            idx = -1 if self.train_end else 0
+            self.stress_label_idx = skip_rows[skip_rows["Label"] == 1].index[idx] - self.env_data.index[0]
 
-        num_stress_label = len(self.env_data[self.env_data["Label"] == 1].index.tolist())
-        self.stress_labels_time = np.inf
-        if num_stress_label > 0:
-            self.stress_labels_time = min(self.env_data[self.env_data["Label"] == 1].index.tolist())
+        self.env_data_ = torch.tensor(np.array(self.env_data["Normwear_Input"].tolist(), dtype=np.float32))
+        self.env_data_ = self.env_data_.reshape(-1, 6, 390).unfold(0, 10, 1)
+        self.env_data_ = self.env_data_.transpose(1, 3).transpose(2,3)
+        
+        with torch.amp.autocast(device_type="cuda"):
+            with torch.no_grad():
+                logits, obs = self.pretrained_model(torch.tensor(self.env_data_[self.timestep]).detach().clone().unsqueeze(0).to(torch.float16).cuda())
+        stress_prob = F.softmax(logits, dim=1)
 
-        obs = np.array(self.env_data["Features"].iloc[self.timestep : self.timestep + self.config.past_window].tolist(), dtype=np.float32) # shape: (T, Feature dim)
-        return obs, {}
+        self.past_prediction_buffer = np.zeros((len(self.env_data_), 1))
+        self.past_prediction_buffer[0, :] = stress_prob[0][1].item()
+
+        obs = np.concatenate((obs.cpu().numpy(), np.expand_dims(self._get_past_features_metrics(), 0)), axis=1)
+
+        info = {"prob": stress_prob[0][1].item()}
+
+        return obs, info
 
     def step(self, action):
         terminated = False
-        reward = 0.0
+        reward = self.config.wait_penalty
         truncation = False
         info = {}
+        self.timestep += 1
 
         # Detect Stress
         if action == 1:
             terminated = True
-            
-            t_diff = self.stress_labels_time - (self.timestep + self.config.past_window)
-            if t_diff <= self.config.early_detection_window and t_diff >= -self.config.late_detection_window:
-                reward = self.config.r_true_positive
+
+            if self.stress_label == 1:
+                reward = self.config.correct_base + max(self.config.correct_lead * ((-1) * abs(self.stress_label_idx - 1 - self.timestep) + self.stress_label_idx) / max(1, self.stress_label_idx - 1), 0)
             else:
-                reward = self.config.r_false_positive
-        else:
-            t_diff = self.stress_labels_time - (self.timestep + self.config.past_window)
-            if t_diff > self.config.early_detection_window:
-                reward = self.config.r_true_negative
-            elif t_diff < -self.config.late_detection_window:
-                reward = self.config.r_false_negative
-                terminated = True
+                reward = self.config.wrong_base + self.config.wrong_lead * (self.stress_label_idx - 1 - self.timestep) / max(1, self.stress_label_idx - 1)
 
         # Played till end of environment without detecting stress
-        if self.timestep >= self.config.env_length - self.config.past_window:
-            truncation = True
+        if self.timestep >= len(self.env_data_) - 1:
+            terminated = True
+            if action == 0:
+                if self.stress_label == 0:
+                    reward = self.config.correct_base
+                else:
+                    reward = self.config.no_commit
 
-        self.timestep += 1
-        obs = np.array(self.env_data["Features"].iloc[self.timestep : self.timestep + self.config.past_window].tolist(), dtype=np.float32)
+        with torch.amp.autocast(device_type="cuda"):
+            with torch.no_grad():
+                logits, obs = self.pretrained_model(torch.tensor(self.env_data_[self.timestep]).detach().clone().unsqueeze(0).to(torch.float16).cuda())
+        stress_prob = F.softmax(logits, dim=1)
+
+        self.past_prediction_buffer[1:, :] = self.past_prediction_buffer[0:-1, :]
+        self.past_prediction_buffer[0, :] = stress_prob[0][1].item()
+
+        obs = np.concatenate((obs.cpu().numpy(), np.expand_dims(self._get_past_features_metrics(), 0)), axis=1)
+
+        info["prob"] = stress_prob[0][1].item()
 
         return obs, reward, terminated, truncation, info
+    def _get_past_features_metrics(self):
+        buf = self.past_prediction_buffer.flatten()
+        mean_10 = np.mean(buf[:min(10, self.timestep + 1)])
+        std_10 = np.std(buf[:min(10, self.timestep + 1)])
+        delta = buf[0] - buf[1]
+        y_10 = buf[:min(10, 2)][::-1] 
+        x_10 = np.arange(len(y_10))
+        slope_10 = np.polyfit(x_10, y_10, 1)[0]
+        span = min(10, self.timestep)
+        alpha = 2 / (span + 1)
+        chronological_buf = buf[:self.timestep + 1][::-1] 
 
-def make_env(seed=None):
-    def _init():
-        env = StressDetectionEnv(seed=seed)
-        return env
-    return _init
+        ema_array = np.zeros_like(chronological_buf)
+        ema_array[0] = chronological_buf[0]
+        for i in range(1, len(chronological_buf)):
+            ema_array[i] = alpha * chronological_buf[i] + (1 - alpha) * ema_array[i-1]
+        ema = ema_array[-1]
 
-def train_dqn_vector(vec_env, total_steps=50000):
-    # Hyperparameters
-    BATCH_SIZE = 128       # Increased batch size since we gather data faster
-    GAMMA = 0.99
-    LR = 1e-4
-    MEMORY_SIZE = 100000
-    TARGET_UPDATE_FREQ = 10 
-    
-    EPSILON_START = 1.0
-    EPSILON_END = 0.05
-    EPSILON_DECAY = 10000 
+        persist_3 = float(1.0 - np.prod(1.0 - buf[0:min(3, self.timestep + 1)]))
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Training on device: {device}")
+        mean_all = np.mean([buf[:self.timestep + 1]])
+        std_all = np.std(buf[:self.timestep + 1])
 
-    # For VectorEnvs, we use single_observation_space and single_action_space
-    single_obs_shape = vec_env.single_observation_space.shape
-    n_actions = vec_env.single_action_space.n
-    num_envs = vec_env.num_envs
+        y_all = buf[:max(self.timestep + 1, 2)][::-1]
+        x_all = np.arange(len(y_all))
+        slope_all = np.polyfit(x_all, y_all, 1)[0]
+        return np.array([buf[0], mean_10, std_10, delta, slope_10, ema, persist_3, mean_all, std_all, slope_all])
 
-    policy_net = DQN(single_obs_shape, n_actions).to(device)
-    target_net = DQN(single_obs_shape, n_actions).to(device)
-    target_net.load_state_dict(policy_net.state_dict())
-    target_net.eval()
-
-    optimizer = optim.Adam(policy_net.parameters(), lr=LR)
-    memory = ReplayBuffer(MEMORY_SIZE)
-    loss_fn = nn.SmoothL1Loss()
-
-    # Reset all environments once at the beginning
-    states, _ = vec_env.reset()
-    
-    # Track episodic returns manually for logging
-    episode_returns = np.zeros(num_envs)
-
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    writer = SummaryWriter(f"run/{timestamp}")
-
-    for step in range(total_steps):
-        epsilon = EPSILON_END + (EPSILON_START - EPSILON_END) * \
-                  np.exp(-1. * step / EPSILON_DECAY)
-
-        # --- Batched Action Selection ---
-        if random.random() > epsilon:
-            with torch.no_grad():
-                states_tensor = torch.FloatTensor(states).to(device)
-                q_values = policy_net(states_tensor)
-                actions = q_values.argmax(dim=1).cpu().numpy()
-        else:
-            actions = vec_env.action_space.sample()
-
-        # --- Step All Environments ---
-        next_states, rewards, terminations, truncations, infos = vec_env.step(actions)
-        dones = terminations | truncations
-        episode_returns += rewards
-
-        # --- Handle Gymnasium VectorEnv Auto-Resets ---
-        # Copy next_states to modify them without affecting the env's internal arrays
-        real_next_states = next_states.copy()
-        
-        writer.add_scalar("Reward", episode_returns.mean(), step * num_envs)
-        writer.add_scalar("Env terminated", dones.sum(), step * num_envs)
-        writer.add_scalar("Accuracy/True Positive", (rewards == Config().r_true_positive).sum(), step * num_envs)
-        writer.add_scalar("Accuracy/False Positive", (rewards == Config().r_false_positive).sum(), step * num_envs)
-        writer.add_scalar("Accuracy/True Negative", (rewards == Config().r_true_negative).sum(), step * num_envs)
-        writer.add_scalar("Accuracy/False Negative", (rewards == Config().r_false_negative).sum(), step * num_envs)
-        writer.add_scalar("Epsilon", epsilon, step * num_envs)
-
-        # If any environment finished, extract its true final state
-        for i, d in enumerate(dones):
-            if d:
-                if step % 50 == 0:
-                    print(f"Step {step} | Env {i} completed | Reward: {episode_returns[i]:.2f} | Epsilon: {epsilon:.3f}")
-                        
-                # Reset the return tracker for this sub-environment
-                episode_returns[i] = 0 
-
-        # --- Store in Memory ---
-        memory.push_batch(states, actions, rewards, real_next_states, dones)
-        
-        # We assign `states = next_states` (the raw output from step), 
-        # so the next loop starts with the newly reset state if an env finished.
-        states = next_states
-
-        # --- Optimize Model ---
-        if len(memory) >= BATCH_SIZE:
-            b_states, b_actions, b_rewards, b_next_states, b_dones = memory.sample(BATCH_SIZE)
-            
-            states_t = torch.FloatTensor(b_states).to(device)
-            actions_t = torch.LongTensor(b_actions).unsqueeze(1).to(device)
-            rewards_t = torch.FloatTensor(b_rewards).unsqueeze(1).to(device)
-            next_states_t = torch.FloatTensor(b_next_states).to(device)
-            dones_t = torch.FloatTensor(b_dones).unsqueeze(1).to(device)
-
-            current_q_values = policy_net(states_t).gather(1, actions_t)
-
-            with torch.no_grad():
-                max_next_q_values = target_net(next_states_t).max(1)[0].unsqueeze(1)
-                expected_q_values = rewards_t + (GAMMA * max_next_q_values * (1 - dones_t))
-
-            loss = loss_fn(current_q_values, expected_q_values)
-            
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_value_(policy_net.parameters(), 100)
-            optimizer.step()
-
-        # --- Update Target Network ---
-        if step % TARGET_UPDATE_FREQ == 0:
-            target_net.load_state_dict(policy_net.state_dict())
-
-    return policy_net
 
 if __name__ == "__main__":
-    num_parallel_envs = 128
-    vec_env = gym.vector.SyncVectorEnv([make_env(i) for i in range(num_parallel_envs)])
-    # 3. Train!
-    trained_model = train_dqn_vector(vec_env, total_steps=5000)
-    
-    vec_env.close()
+    SUBJECT_IDS = (
+        [f"S{i}" for i in range(2, 12)] +
+        [f"S{i}" for i in range(13, 18)]
+    )
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    name = f"{timestamp}_dqn_normwear_warmstart"
+
+    checkpoint_callback = CheckpointCallback(
+        save_freq=50000,
+        save_path=f"/diniuvol/jonah/Eric/run/{name}", 
+        name_prefix="dqn_model",
+    )
+
+    env = StressDetectionEnv_WESAD_Events()
+
+    policy_kwargs = dict(net_arch=[512, 256])
+    model = stable_baselines3.DQN(
+        "MlpPolicy", 
+        env, 
+        policy_kwargs=policy_kwargs,
+        verbose=1,
+        exploration_initial_eps=0.8,
+        exploration_final_eps=0.05,
+        tensorboard_log=f"/diniuvol/jonah/Eric/run/{name}"
+    )
+
+    # If there's a pretrained model, load its weights into the current model for warmstart
+    pretrained_weights = torch.load("/diniuvol/jonah/Eric/run/20260707-110445_dqn_warmstart_pretrain_mlp/model_latest.pth")
+    sb3_expected_keys = model.q_net.state_dict().keys()
+    print(f"SB3 expected keys: {sb3_expected_keys}  Pretrained keys: {pretrained_weights.keys()}")
+    new_state_dict = {}
+    for sb3_key, pretrained_weight in zip(sb3_expected_keys, pretrained_weights.values()):
+        new_state_dict[sb3_key] = pretrained_weight
+
+    model.q_net.load_state_dict(new_state_dict, strict=True)
+    model.q_net_target.load_state_dict(model.q_net.state_dict())
+
+    logging_callback = InfoLoggingCallback(info_key="prob")
+
+    model.learn(total_timesteps=500000, callback=checkpoint_callback, log_interval=500)
+    model.save(f"/diniuvol/jonah/Eric/run/{name}/model")
+
